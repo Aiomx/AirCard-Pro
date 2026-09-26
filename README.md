@@ -4,10 +4,6 @@
 > **Tested on iOS 27 release.**
 > Powered by the `airlift` AirTraffic sync exploit.
 
-<p align="left">
-  <a href="https://www.paypal.com/donate/?hosted_button_id=98QRTC2HFRA4Y"><img src="https://img.shields.io/badge/Donate-PayPal-00457C?style=flat-square&logo=paypal" alt="Donate with PayPal" /></a>
-</p>
-
 ---
 
 ## Features
@@ -26,7 +22,7 @@
 ## Installation
 
 ### macOS (Universal DMG)
-1. Download **`AirCard.dmg`** from [Releases](https://github.com/mak5er/AirCard/releases).
+1. Download **`AirCard.dmg`** from [Releases](https://github.com/Aiomx/AirCard-Pro/releases).
 2. Open `AirCard.dmg` and drag **`AirCard.app`** into your **Applications** folder.
 3. Fully compatible with both **Apple Silicon** and **Intel (x86)** Macs.
 
@@ -87,8 +83,8 @@ for the verified environment and remaining coverage.
 ## Building from Source
 
 ```sh
-git clone https://github.com/mak5er/AirCard.git
-cd AirCard
+git clone https://github.com/Aiomx/AirCard-Pro.git
+cd AirCard-Pro
 chmod +x build.sh
 ./build.sh
 ```
@@ -96,21 +92,6 @@ This builds universal binaries (`arm64` + `x86_64`), bundles dependencies into `
 
 ---
 
-## Contributors
-- **[@mak5er](https://github.com/mak5er)** (Developer) — [GitHub](https://github.com/mak5er) · [Twitter / X](https://x.com/mak5er)
-- **[@Lumid-Off](https://github.com/Lumid-Off)** (Contributor & Developer) — [GitHub](https://github.com/Lumid-Off) · [Twitter / X](https://x.com/LumidOff)
-- **[AirLift](https://github.com/0xjohnnydev/airlift)** by **[0xjohnny (@0xjohnnydev)](https://github.com/0xjohnnydev)**: Original AirTraffic/ATAirlock sandbox escape and proof of concept underlying `AirliftFFI`.
-
-## Credits
-- Core exploit based on `airlift` (AirTraffic sync escape).
-
 ---
 
-## Support
-
-If you find AirCard useful, you can support future development:
-
-- **PayPal**: [Donate via PayPal](https://www.paypal.com/donate/?hosted_button_id=98QRTC2HFRA4Y)
-- **TON**: `UQBm9KPhtMw-XVVjirUoa09wzrlyWsbeZhKfefl1Uw-qNZ-r`
-- **USDT (TRC20)**: `TDkDMCyjYxgvkWUnQiF5Erk2RyPQMT6G1n`
-- **USDT / BNB (BEP20)**: `0x0954dc491c502849d04956ef74634aa5931a08e8`
+This project is adapted from the original AirCard project.
