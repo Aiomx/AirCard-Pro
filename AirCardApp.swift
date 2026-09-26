@@ -22,14 +22,63 @@ struct CardItem: Identifiable, Hashable {
     var isSelected: Bool = true
     var customImageURL: URL? = nil
     var customImage: NSImage? = nil
+    var walletArtworkURL: URL? = nil
+    var walletArtwork: NSImage? = nil
+    var walletArtworkKind: String? = nil
+    var walletBackgroundColor: String? = nil
+    var walletInfoLoaded: Bool = false
+    var name: String = ""
+    var source: String = ""
+    var cardNumber: String = ""
+    var nameManuallyEdited: Bool = false
+    var sourceManuallyEdited: Bool = false
+    var cardNumberManuallyEdited: Bool = false
     
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
     }
     
     static func == (lhs: CardItem, rhs: CardItem) -> Bool {
-        lhs.id == rhs.id && lhs.isSelected == rhs.isSelected && lhs.customImageURL == rhs.customImageURL
+        lhs.id == rhs.id &&
+        lhs.isSelected == rhs.isSelected &&
+        lhs.customImageURL == rhs.customImageURL &&
+        lhs.walletArtworkURL == rhs.walletArtworkURL &&
+        lhs.walletArtworkKind == rhs.walletArtworkKind &&
+        lhs.walletBackgroundColor == rhs.walletBackgroundColor &&
+        lhs.walletInfoLoaded == rhs.walletInfoLoaded &&
+        lhs.name == rhs.name &&
+        lhs.source == rhs.source &&
+        lhs.cardNumber == rhs.cardNumber &&
+        lhs.nameManuallyEdited == rhs.nameManuallyEdited &&
+        lhs.sourceManuallyEdited == rhs.sourceManuallyEdited &&
+        lhs.cardNumberManuallyEdited == rhs.cardNumberManuallyEdited
     }
+}
+
+private struct SavedCardDetails: Codable {
+    let id: String
+    let name: String
+    let source: String
+    let cardNumber: String
+    let customImagePath: String?
+    let walletArtworkPath: String?
+    let walletArtworkKind: String?
+    let walletBackgroundColor: String?
+    let walletInfoLoaded: Bool?
+    let nameManuallyEdited: Bool?
+    let sourceManuallyEdited: Bool?
+    let cardNumberManuallyEdited: Bool?
+}
+
+private struct WalletCardReadResult: Decodable, Sendable {
+    let ok: Bool
+    let name: String?
+    let source: String?
+    let cardNumber: String?
+    let backgroundColor: String?
+    let artworkPath: String?
+    let artworkKind: String?
+    let error: String?
 }
 
 enum AppTab: String, CaseIterable, Identifiable {
@@ -485,6 +534,9 @@ class AppViewModel: ObservableObject {
     @Published var device: DeviceInfo?
     @Published var isCheckingDevice = false
     @Published var isScanningCards = false
+    @Published var isReadingWalletCards = false
+    @Published var walletReadProgress = 0
+    @Published var walletReadTotal = 0
     @Published var cards: [CardItem] = []
     
     @Published var isFlashing = false
@@ -503,6 +555,7 @@ class AppViewModel: ObservableObject {
     private let storageKey = "mak5er.aircard.savedCards"
     private let legacyStorageKey1 = "mak5er.savedCards"
     private let legacyStorageKey2 = "LumiCards.savedCards"
+    private let cardDetailsStorageKey = "mak5er.aircard.savedCardDetails.v1"
     
     nonisolated static let cardRegexes: [NSRegularExpression] = [
         try! NSRegularExpression(pattern: "/(?:Cards|Passes/Cards)/([-A-Za-z0-9_+=]{20,44})(?:\\.pkpass|\\.cache|\\.pkcache|/|\\s|\"|'|\\)|,|$)"),
@@ -657,17 +710,110 @@ class AppViewModel: ObservableObject {
         ]
         loaded.removeAll { dummyHashes.contains($0) || ($0.contains("-") && $0.count == 36) }
         
-        self.cards = loaded.map { CardItem(id: $0, isSelected: true) }
+        let savedDetails: [String: SavedCardDetails]
+        if let data = UserDefaults.standard.data(forKey: cardDetailsStorageKey),
+           let details = try? JSONDecoder().decode([SavedCardDetails].self, from: data) {
+            savedDetails = Dictionary(details.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+        } else {
+            savedDetails = [:]
+        }
+
+        self.cards = loaded.map { cardID in
+            guard let details = savedDetails[cardID] else {
+                return CardItem(id: cardID, isSelected: true)
+            }
+            let imageURL = details.customImagePath.map { URL(fileURLWithPath: $0) }
+            let walletImageURL = details.walletArtworkPath.map { URL(fileURLWithPath: $0) }
+            return CardItem(
+                id: cardID,
+                isSelected: true,
+                customImageURL: imageURL,
+                customImage: imageURL.flatMap { NSImage(contentsOf: $0) },
+                walletArtworkURL: walletImageURL,
+                walletArtwork: walletImageURL.flatMap { NSImage(contentsOf: $0) },
+                walletArtworkKind: details.walletArtworkKind,
+                walletBackgroundColor: details.walletBackgroundColor,
+                walletInfoLoaded: details.walletInfoLoaded ?? false,
+                name: details.name,
+                source: details.source,
+                cardNumber: details.cardNumber,
+                nameManuallyEdited: details.nameManuallyEdited ?? !details.name.isEmpty,
+                sourceManuallyEdited: details.sourceManuallyEdited ?? !details.source.isEmpty,
+                cardNumberManuallyEdited: details.cardNumberManuallyEdited ?? !details.cardNumber.isEmpty
+            )
+        }
         log("Loaded \(cards.count) real card(s) from storage.")
     }
     
     func saveCards() {
         let hashes = cards.map { $0.id }
         UserDefaults.standard.set(hashes, forKey: storageKey)
+
+        let details = cards.map {
+            SavedCardDetails(
+                id: $0.id,
+                name: $0.name,
+                source: $0.source,
+                cardNumber: $0.cardNumber,
+                customImagePath: $0.customImageURL?.path,
+                walletArtworkPath: $0.walletArtworkURL?.path,
+                walletArtworkKind: $0.walletArtworkKind,
+                walletBackgroundColor: $0.walletBackgroundColor,
+                walletInfoLoaded: $0.walletInfoLoaded,
+                nameManuallyEdited: $0.nameManuallyEdited,
+                sourceManuallyEdited: $0.sourceManuallyEdited,
+                cardNumberManuallyEdited: $0.cardNumberManuallyEdited
+            )
+        }
+        if let data = try? JSONEncoder().encode(details) {
+            UserDefaults.standard.set(data, forKey: cardDetailsStorageKey)
+        }
         
         let jsonPath = NSString(string: "~/.aircard_cards.json").expandingTildeInPath
         if let data = try? JSONEncoder().encode(hashes) {
             try? data.write(to: URL(fileURLWithPath: jsonPath), options: .atomic)
+        }
+    }
+
+    private func cardArtworkDirectory() -> URL {
+        let supportDirectory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        return supportDirectory
+            .appendingPathComponent("AirCard", isDirectory: true)
+            .appendingPathComponent("Card Covers", isDirectory: true)
+    }
+
+    private func walletArtworkDirectory() -> URL {
+        let supportDirectory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        return supportDirectory
+            .appendingPathComponent("AirCard", isDirectory: true)
+            .appendingPathComponent("Wallet Artwork", isDirectory: true)
+    }
+
+    private func removeStoredCardImage(at url: URL?) {
+        guard let url else { return }
+        let directory = cardArtworkDirectory().deletingLastPathComponent().standardizedFileURL.path + "/"
+        guard url.standardizedFileURL.path.hasPrefix(directory) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func copyCardImageToStorage(_ sourceURL: URL) -> URL? {
+        let fileManager = FileManager.default
+        let directory = cardArtworkDirectory()
+        do {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            let fileExtension = sourceURL.pathExtension.isEmpty ? "png" : sourceURL.pathExtension
+            let destination = directory.appendingPathComponent("\(UUID().uuidString).\(fileExtension)")
+            try fileManager.copyItem(at: sourceURL, to: destination)
+            return destination
+        } catch {
+            log("Could not copy card cover into AirCard storage: \(error.localizedDescription)")
+            return nil
         }
     }
     
@@ -688,12 +834,20 @@ class AppViewModel: ObservableObject {
     }
     
     func deleteCard(id: String) {
+        if let card = cards.first(where: { $0.id == id }) {
+            removeStoredCardImage(at: card.customImageURL)
+            removeStoredCardImage(at: card.walletArtworkURL)
+        }
         cards.removeAll { $0.id == id }
         saveCards()
         log("Removed card: \(id)")
     }
     
     func clearAllCards() {
+        cards.forEach {
+            removeStoredCardImage(at: $0.customImageURL)
+            removeStoredCardImage(at: $0.walletArtworkURL)
+        }
         cards.removeAll()
         saveCards()
         log("Cleared all cards.")
@@ -701,19 +855,125 @@ class AppViewModel: ObservableObject {
     
     func setCardImage(for cardId: String, url: URL) {
         if let idx = cards.firstIndex(where: { $0.id == cardId }) {
-            cards[idx].customImageURL = url
-            cards[idx].customImage = NSImage(contentsOf: url)
+            let storedURL = copyCardImageToStorage(url) ?? url
+            removeStoredCardImage(at: cards[idx].customImageURL)
+            cards[idx].customImageURL = storedURL
+            cards[idx].customImage = NSImage(contentsOf: storedURL)
             cards[idx].isSelected = true
+            saveCards()
             log("Assigned custom skin to card: \(cardId.prefix(12))...")
         }
     }
     
     func clearCardImage(for cardId: String) {
         if let idx = cards.firstIndex(where: { $0.id == cardId }) {
+            removeStoredCardImage(at: cards[idx].customImageURL)
             cards[idx].customImageURL = nil
             cards[idx].customImage = nil
+            saveCards()
             log("Cleared custom skin for: \(cardId.prefix(12))...")
         }
+    }
+
+    func readWalletDetails(for cardID: String? = nil) {
+        guard !isReadingWalletCards else { return }
+        guard let udid = device?.udid, device?.connected == true else {
+            errorMessage = "Connect the iPhone before reading Wallet details."
+            return
+        }
+        let targets = cards.filter { cardID == nil || $0.id == cardID }
+        guard !targets.isEmpty else { return }
+
+        let imageDirectory = walletArtworkDirectory()
+        do {
+            try FileManager.default.createDirectory(at: imageDirectory, withIntermediateDirectories: true)
+        } catch {
+            errorMessage = "Could not create AirCard's local Wallet artwork folder."
+            return
+        }
+
+        isReadingWalletCards = true
+        walletReadProgress = 0
+        walletReadTotal = targets.count
+        statusText = "Reading real Wallet details from iPhone…"
+        log("Started reading Wallet details for \(targets.count) card(s).")
+
+        let scriptDir = self.scriptDir
+        let workItems = targets.map { ($0.id, imageDirectory.appendingPathComponent("\(UUID().uuidString).image")) }
+        Task.detached {
+            var successCount = 0
+            for (index, item) in workItems.enumerated() {
+                let (identifier, artworkURL) = item
+                var result: WalletCardReadResult?
+                let process = Process()
+                process.executableURL = AppViewModel.pythonExecutableURL
+                process.environment = AppViewModel.processEnvironment
+                process.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
+                process.arguments = ["aircard_backend.py", "--inspect-card", udid, identifier, artworkURL.path]
+
+                let output = Pipe()
+                process.standardOutput = output
+                process.standardError = FileHandle.nullDevice
+                do {
+                    try process.run()
+                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    if process.terminationStatus == 0 {
+                        result = try? JSONDecoder().decode(WalletCardReadResult.self, from: data)
+                    }
+                } catch {
+                    result = nil
+                }
+
+                if let result, result.ok {
+                    let applied = await MainActor.run {
+                        self.applyWalletCardReadResult(result, artworkURL: artworkURL, to: identifier)
+                    }
+                    if applied { successCount += 1 }
+                }
+                await MainActor.run {
+                    self.walletReadProgress = index + 1
+                    if self.walletReadProgress < self.walletReadTotal {
+                        self.statusText = "Reading Wallet details \(self.walletReadProgress)/\(self.walletReadTotal)…"
+                    }
+                }
+                if result?.ok != true {
+                    try? FileManager.default.removeItem(at: artworkURL)
+                }
+            }
+
+            let completedSuccessCount = successCount
+            let completedTotal = workItems.count
+            await MainActor.run {
+                self.isReadingWalletCards = false
+                self.statusText = "Read real Wallet details for \(completedSuccessCount) of \(completedTotal) card(s)."
+                self.log("Wallet read finished: \(completedSuccessCount)/\(completedTotal) card(s) returned real pass metadata.")
+                self.saveCards()
+            }
+        }
+    }
+
+    private func applyWalletCardReadResult(_ result: WalletCardReadResult, artworkURL: URL, to cardID: String) -> Bool {
+        guard let index = cards.firstIndex(where: { $0.id == cardID }) else { return false }
+        if !cards[index].nameManuallyEdited { cards[index].name = result.name ?? "" }
+        if !cards[index].sourceManuallyEdited { cards[index].source = result.source ?? "" }
+        if !cards[index].cardNumberManuallyEdited { cards[index].cardNumber = result.cardNumber ?? "" }
+        cards[index].walletInfoLoaded = true
+        cards[index].walletBackgroundColor = result.backgroundColor
+
+        if let path = result.artworkPath,
+           let kind = result.artworkKind,
+           let image = NSImage(contentsOfFile: path) {
+            let importedURL = URL(fileURLWithPath: path)
+            if cards[index].walletArtworkURL != importedURL {
+                removeStoredCardImage(at: cards[index].walletArtworkURL)
+            }
+            cards[index].walletArtworkURL = importedURL
+            cards[index].walletArtwork = image
+            cards[index].walletArtworkKind = kind
+        }
+        saveCards()
+        return true
     }
     
     // MARK: - Device Connection
@@ -1445,122 +1705,48 @@ struct WalletCardView: View {
     @Binding var card: CardItem
     let cardIndex: Int
     let onPickImage: () -> Void
+    let onSetImage: (URL) -> Void
     let onClearImage: () -> Void
     let onDelete: () -> Void
+    let onMetadataChange: () -> Void
+    let onReadWalletInfo: () -> Void
     
     @State private var isHovered = false
     @State private var isTargeted = false
     @State private var copied = false
+    @State private var showDetails = false
+
+    private var displayName: String {
+        let name = card.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "Card #\(cardIndex + 1)" : name
+    }
+
+    private var displaySource: String {
+        let source = card.source.trimmingCharacters(in: .whitespacesAndNewlines)
+        return source
+    }
+
+    private var parsedWalletColor: (red: Double, green: Double, blue: Double)? {
+        guard let value = card.walletBackgroundColor else { return nil }
+        let channels = value.split { !$0.isNumber }.compactMap { Double($0) }
+        guard channels.count >= 3 else { return nil }
+        return (channels[0] / 255, channels[1] / 255, channels[2] / 255)
+    }
+
+    private var walletFaceColor: Color {
+        guard let rgb = parsedWalletColor else { return Color(NSColor.controlBackgroundColor) }
+        return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
+    }
+
+    private var walletFaceTextColor: Color {
+        guard let rgb = parsedWalletColor else { return .primary }
+        let luminance = 0.2126 * rgb.red + 0.7152 * rgb.green + 0.0722 * rgb.blue
+        return luminance > 0.58 ? .black : .white
+    }
     
     var body: some View {
         VStack(spacing: 10) {
-            // Card Mockup
-            ZStack {
-                if let img = card.customImage {
-                    // Custom Skin Applied
-                    ZStack(alignment: .topTrailing) {
-                        Image(nsImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 290, height: 182)
-                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        
-                        // Subtle Gloss
-                        LinearGradient(
-                            colors: [.white.opacity(0.18), .clear, .black.opacity(0.12)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        
-                        // Top Right Clear Button
-                        Button(action: onClearImage) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 20))
-                                .foregroundColor(.white.opacity(0.9))
-                                .background(Circle().fill(Color.black.opacity(0.55)))
-                        }
-                        .buttonStyle(.plain)
-                        .padding(10)
-                        .help("Remove skin")
-                        
-                        // Hover overlay: Change Skin
-                        if isHovered {
-                            VStack {
-                                Spacer()
-                                HStack {
-                                    Spacer()
-                                    Label("Change Skin", systemImage: "photo.badge.arrow.forward")
-                                        .font(.caption)
-                                        .fontWeight(.semibold)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 6)
-                                        .background(.ultraThinMaterial)
-                                        .cornerRadius(20)
-                                        .shadow(radius: 4)
-                                    Spacer()
-                                }
-                                .padding(.bottom, 12)
-                            }
-                        }
-                    }
-                } else {
-                    // Empty / Placeholder Card Mockup
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color(NSColor.controlBackgroundColor),
-                                        Color(NSColor.windowBackgroundColor).opacity(0.8)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                        
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .stroke(
-                                isTargeted ? Color.accentColor : (isHovered ? Color.secondary.opacity(0.4) : Color.secondary.opacity(0.2)),
-                                style: StrokeStyle(lineWidth: isTargeted ? 2 : 1, dash: card.customImage == nil ? [6, 4] : [])
-                            )
-                        
-                        // Card Chip & Contactless indicator
-                        VStack(alignment: .leading) {
-                            HStack {
-                                Image(systemName: "wave.3.right")
-                                    .font(.system(size: 14))
-                                    .foregroundColor(.secondary.opacity(0.5))
-                                Spacer()
-                                Image(systemName: "creditcard")
-                                    .font(.system(size: 16))
-                                    .foregroundColor(.secondary.opacity(0.4))
-                            }
-                            .padding(14)
-                            Spacer()
-                        }
-                        
-                        // Center Action
-                        VStack(spacing: 8) {
-                            Image(systemName: isHovered || isTargeted ? "photo.badge.plus" : "plus.circle.fill")
-                                .font(.system(size: 32))
-                                .foregroundColor(isTargeted ? .accentColor : (isHovered ? .accentColor : .secondary.opacity(0.7)))
-                                .scaleEffect(isHovered ? 1.08 : 1.0)
-                                .animation(.spring(response: 0.3), value: isHovered)
-                            
-                            Text(isTargeted ? "Drop image here" : "Assign Card Skin")
-                                .font(.subheadline)
-                                .fontWeight(.medium)
-                                .foregroundColor(.primary)
-                            
-                            Text("Click to browse or drag image")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .frame(width: 290, height: 182)
-                }
-            }
+            cardFace
             .frame(width: 290, height: 182)
             .shadow(color: .black.opacity(isHovered ? 0.22 : 0.12), radius: isHovered ? 10 : 5, y: isHovered ? 5 : 2)
             .onHover { h in isHovered = h }
@@ -1575,22 +1761,18 @@ struct WalletCardView: View {
                         } else if let data = item as? Data, let urlStr = String(data: data, encoding: .utf8), let url = URL(string: urlStr) {
                             fileURL = url
                         }
-                        if let url = fileURL, let img = NSImage(contentsOf: url) {
+                        if let url = fileURL, NSImage(contentsOf: url) != nil {
                             Task { @MainActor in
-                                card.customImageURL = url
-                                card.customImage = img
-                                card.isSelected = true
+                                onSetImage(url)
                             }
                         }
                     }
                     return true
                 } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                     provider.loadItem(forTypeIdentifier: UTType.image.identifier, options: nil) { item, _ in
-                        if let url = item as? URL, let img = NSImage(contentsOf: url) {
+                        if let url = item as? URL, NSImage(contentsOf: url) != nil {
                             Task { @MainActor in
-                                card.customImageURL = url
-                                card.customImage = img
-                                card.isSelected = true
+                                onSetImage(url)
                             }
                         } else if let img = item as? NSImage {
                             let tempURL = FileManager.default.temporaryDirectory
@@ -1601,9 +1783,7 @@ struct WalletCardView: View {
                                 try? pngData.write(to: tempURL)
                             }
                             Task { @MainActor in
-                                card.customImageURL = tempURL
-                                card.customImage = img
-                                card.isSelected = true
+                                onSetImage(tempURL)
                             }
                         }
                     }
@@ -1618,44 +1798,48 @@ struct WalletCardView: View {
                     .labelsHidden()
                     .help("Include in flash")
                 
-                Text("Card #\(cardIndex + 1)")
-                    .font(.system(size: 12, weight: .semibold))
-                
-                // Monospace Hash Pill with Copy
-                HStack(spacing: 4) {
-                    Text(card.id.prefix(8) + "…" + card.id.suffix(6))
-                        .font(.system(size: 10, design: .monospaced))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Card #\(cardIndex + 1)")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(card.id)
+                        .font(.system(size: 8, design: .monospaced))
                         .foregroundColor(.secondary)
-                    
-                    Button(action: {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(card.id, forType: .string)
-                        copied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
-                    }) {
-                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 9))
-                            .foregroundColor(copied ? .green : .secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help(copied ? "Copied!" : "Copy full hash")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.55)
+                        .textSelection(.enabled)
+                        .help("Wallet ID: \(card.id)")
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
+
+                Button(action: {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(card.id, forType: .string)
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                }) {
+                    Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 9))
+                        .foregroundColor(copied ? .green : .secondary)
+                }
+                .buttonStyle(.plain)
+                .help(copied ? "Copied!" : "Copy full Wallet ID")
                 
                 Spacer()
                 
-                // Status badge
                 if card.customImage != nil {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundColor(.green)
                         .font(.system(size: 12))
-                        .help("Skin assigned and ready")
+                        .help("Custom cover assigned")
                 }
+
+                Button { showDetails = true } label: {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Edit card name, source, and number")
                 
-                // Delete button
                 Button(action: onDelete) {
                     Image(systemName: "trash")
                         .font(.system(size: 11))
@@ -1666,6 +1850,16 @@ struct WalletCardView: View {
             }
             .padding(.horizontal, 4)
         }
+        .sheet(isPresented: $showDetails) {
+            CardDetailsEditor(
+                card: $card,
+                onPickImage: onPickImage,
+                onReadWalletInfo: onReadWalletInfo,
+                onSave: { cardID in
+                    if card.id == cardID { onMetadataChange() }
+                }
+            )
+        }
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -1675,6 +1869,166 @@ struct WalletCardView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .stroke(card.isSelected ? Color.accentColor.opacity(0.3) : Color.clear, lineWidth: 1)
         )
+    }
+
+    private var cardFace: some View {
+        ZStack(alignment: .topTrailing) {
+            let isRenderedWalletFace = card.customImage == nil && card.walletArtworkKind == "walletFace"
+            let displayedImage = card.customImage ?? card.walletArtwork
+
+            if let image = displayedImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 290, height: 182)
+                    .clipped()
+                if !isRenderedWalletFace {
+                    LinearGradient(
+                        colors: [.black.opacity(0.25), .clear, .black.opacity(0.75)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+            } else {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(walletFaceColor)
+                VStack(spacing: 9) {
+                    Image(systemName: card.walletInfoLoaded ? "photo" : "iphone.and.arrow.down.inward")
+                        .font(.system(size: 26, weight: .light))
+                    Text(card.walletInfoLoaded ? "此卡没有可用卡面素材" : "尚未读取 iPhone 中的真实卡面")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+            }
+
+            if !isRenderedWalletFace {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack {
+                        if !displaySource.isEmpty {
+                            Text(displaySource.uppercased())
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .tracking(1.1)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        if card.walletInfoLoaded {
+                            Image(systemName: "checkmark.seal.fill")
+                                .font(.system(size: 13))
+                        }
+                    }
+                    Spacer(minLength: 10)
+                    Text(displayName)
+                        .font(.system(size: 17, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                    Text(card.cardNumber.isEmpty ? (card.walletInfoLoaded ? "卡号后缀未提供" : "尚未读取卡号信息") : card.cardNumber)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                        .padding(.top, 7)
+                }
+                .foregroundStyle(displayedImage == nil ? walletFaceTextColor : Color.white)
+                .padding(17)
+            }
+
+            if card.customImage != nil {
+                Button(action: onClearImage) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 19))
+                        .foregroundColor(.white.opacity(0.95))
+                        .background(Circle().fill(Color.black.opacity(0.5)))
+                }
+                .buttonStyle(.plain)
+                .padding(10)
+                .help("Remove custom cover")
+            }
+
+            if isHovered || isTargeted {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Label(isTargeted ? "Drop cover" : "Change cover", systemImage: "photo.badge.arrow.forward")
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(.ultraThinMaterial)
+                            .clipShape(Capsule())
+                            .padding(10)
+                    }
+                }
+            }
+        }
+        .frame(width: 290, height: 182)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(isTargeted ? Color.accentColor : .white.opacity(0.18), lineWidth: isTargeted ? 2 : 1)
+        }
+    }
+}
+
+private struct CardDetailsEditor: View {
+    @Binding var card: CardItem
+    let onPickImage: () -> Void
+    let onReadWalletInfo: () -> Void
+    let onSave: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Card Details")
+                .font(.title3.weight(.semibold))
+
+            Text("AirCard reads the pass name, issuer, card face, and only the card number suffix that Wallet exposes. You can edit the displayed name and issuer.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("Card name", text: $card.name)
+                TextField("Card source / issuer", text: $card.source)
+                TextField("Card number suffix", text: $card.cardNumber)
+            }
+            .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 8) {
+                Image(systemName: card.customImage != nil ? "photo.fill" : (card.walletArtwork != nil ? "creditcard.fill" : "rectangle.on.rectangle"))
+                    .foregroundStyle(.secondary)
+                Text(card.customImage != nil ? "Custom cover assigned" : (card.walletArtworkKind == "walletFace" ? "真实 Wallet 卡面" : (card.walletArtwork != nil ? "Wallet pass 卡面素材" : "尚未获得真实卡面素材")))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("从 iPhone 读取", action: onReadWalletInfo)
+                    .buttonStyle(.bordered)
+                Button("Change Cover…", action: onPickImage)
+                    .buttonStyle(.bordered)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("WALLET ID")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+                Text(card.id)
+                    .font(.system(size: 10, design: .monospaced))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button("Done") {
+                    onSave(card.id)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+        .onChange(of: card.name) { _, _ in card.nameManuallyEdited = true; onSave(card.id) }
+        .onChange(of: card.source) { _, _ in card.sourceManuallyEdited = true; onSave(card.id) }
+        .onChange(of: card.cardNumber) { _, _ in card.cardNumberManuallyEdited = true; onSave(card.id) }
     }
 }
 
@@ -1735,12 +2089,16 @@ struct ContentView: View {
                             spacing: 20
                         ) {
                             ForEach(Array(vm.cards.indices), id: \.self) { idx in
+                                let cardID = vm.cards[idx].id
                                 WalletCardView(
                                     card: $vm.cards[idx],
                                     cardIndex: idx,
-                                    onPickImage: { openCardImagePicker(for: vm.cards[idx].id) },
-                                    onClearImage: { vm.clearCardImage(for: vm.cards[idx].id) },
-                                    onDelete: { vm.deleteCard(id: vm.cards[idx].id) }
+                                    onPickImage: { openCardImagePicker(for: cardID) },
+                                    onSetImage: { vm.setCardImage(for: cardID, url: $0) },
+                                    onClearImage: { vm.clearCardImage(for: cardID) },
+                                    onDelete: { vm.deleteCard(id: cardID) },
+                                    onMetadataChange: { vm.saveCards() },
+                                    onReadWalletInfo: { vm.readWalletDetails(for: cardID) }
                                 )
                             }
                         }
@@ -1908,6 +2266,29 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.regular)
+
+            HStack(spacing: 5) {
+                Image(systemName: "creditcard.fill")
+                Text("\(vm.cards.count) \(vm.cards.count == 1 ? "card" : "cards")")
+                    .monospacedDigit()
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("\(vm.cards.count) cards in list")
+
+            if !vm.cards.isEmpty {
+                Button(action: { vm.readWalletDetails() }) {
+                    if vm.isReadingWalletCards {
+                        Label("\(vm.walletReadProgress)/\(vm.walletReadTotal)", systemImage: "arrow.triangle.2.circlepath")
+                    } else {
+                        Label("Read Real Info", systemImage: "iphone.and.arrow.down.inward")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .disabled(vm.device?.connected != true || vm.isReadingWalletCards)
+                .help("Read real Wallet card names, number suffixes, and card faces from the connected iPhone")
+            }
             
             if !vm.cards.isEmpty {
                 Button(action: openBulkImagePicker) {

@@ -5,13 +5,16 @@ Backend engine for AirCard native macOS GUI app.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse
 import zipfile
 from pathlib import Path
 
@@ -43,6 +46,7 @@ for lp in lib_paths:
 from apply_card_skin import (
     native,
     operation_ok,
+    read_file,
     write_file,
     write_files_batch,
     remove_files,
@@ -76,6 +80,236 @@ def cmd_device():
 def cmd_get_saved_cards():
     cards = load_saved_cards()
     print(json.dumps({"ok": True, "cards": cards}))
+
+
+def _pass_text(value) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        nested = value.get("value")
+        if isinstance(nested, str):
+            return nested.strip()
+    return ""
+
+
+def _pass_card_suffix(pass_data: dict) -> str:
+    suffix = _pass_text(pass_data.get("primaryAccountNumberSuffix"))
+    digits = re.sub(r"\D", "", suffix)
+    if digits:
+        return f"•••• {digits[-4:]}"
+
+    for style_name in ("boardingPass", "coupon", "eventTicket", "storeCard", "generic"):
+        style = pass_data.get(style_name)
+        if not isinstance(style, dict):
+            continue
+        for group_name in ("headerFields", "primaryFields", "secondaryFields", "auxiliaryFields"):
+            entries = style.get(group_name)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                label = _pass_text(entry.get("label"))
+                value = _pass_text(entry.get("value"))
+                normalized_label = label.lower()
+                if any(term in normalized_label for term in ("account", "card number", "number suffix", "last four")):
+                    digits = re.sub(r"\D", "", value)
+                    if len(digits) >= 4:
+                        return f"•••• {digits[-4:]}"
+    return ""
+
+
+def _wallet_artwork_name(manifest_data: bytes | None) -> str | None:
+    if not manifest_data:
+        return None
+    try:
+        manifest = json.loads(manifest_data)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    files = set(manifest)
+    priorities = (
+        "background@3x.png",
+        "background.png",
+        "strip@3x.png",
+        "strip.png",
+        "thumbnail@3x.png",
+        "thumbnail.png",
+        "logo@3x.png",
+        "logo.png",
+        "icon@3x.png",
+        "icon.png",
+    )
+    for leaf in priorities:
+        if leaf in files:
+            return leaf
+        localized = next(
+            (path for path in files if path.endswith("/" + leaf)),
+            None,
+        )
+        if localized:
+            return localized
+    return None
+
+
+def _save_wallet_image(data: bytes | None, output_path: str) -> bool:
+    if not data:
+        return False
+    is_image = (
+        data.startswith(b"\x89PNG\r\n\x1a\n")
+        or data.startswith(b"\xff\xd8\xff")
+        or data.startswith((b"GIF87a", b"GIF89a"))
+        or data.startswith((b"II*\x00", b"MM\x00*"))
+        or (data.startswith(b"RIFF") and data[8:12] == b"WEBP")
+    )
+    if not is_image:
+        return False
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_bytes(data)
+    return True
+
+
+def _download_wallet_asset(udid: str, pass_dir: str, urls_leaf: str, image_name: str) -> bytes | None:
+    urls_bytes = read_file(udid, pass_dir, urls_leaf, retries=1)
+    if not urls_bytes:
+        return None
+    try:
+        resources = json.loads(urls_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    metadata = resources.get(image_name) if isinstance(resources, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    url = metadata.get("url")
+    hostname = (urllib.parse.urlparse(url).hostname or "").lower() if isinstance(url, str) else ""
+    if not isinstance(url, str) or not url.startswith("https://") or not hostname.endswith(".apple.com"):
+        return None
+
+    expected_size = metadata.get("size")
+    expected_sha1 = metadata.get("sha1")
+    if not isinstance(expected_size, int) or expected_size < 1 or expected_size > 12 * 1024 * 1024:
+        return None
+    if not isinstance(expected_sha1, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", expected_sha1):
+        return None
+
+    def config_quote(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "")
+
+    current_url = url
+    data = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="aircard-wallet-asset-") as directory:
+            image_path = Path(directory) / "asset.bin"
+            for _ in range(4):
+                current_host = (urllib.parse.urlparse(current_url).hostname or "").lower()
+                if not current_url.startswith("https://") or not current_host.endswith(".apple.com"):
+                    return None
+                config = "\n".join((
+                    "silent",
+                    "show-error",
+                    "fail",
+                    "noproxy = \"*\"",
+                    "proto = \"=https\"",
+                    "max-time = 20",
+                    "max-filesize = 12582912",
+                    "user-agent = \"AirCard/1.2.4\"",
+                    f'url = "{config_quote(current_url)}"',
+                    f'output = "{config_quote(str(image_path))}"',
+                    'write-out = "%{http_code}|||%{redirect_url}"',
+                ))
+                response = subprocess.run(
+                    ["/usr/bin/curl", "--config", "-"],
+                    input=config,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=25,
+                    check=False,
+                )
+                status_text, separator, redirect_url = response.stdout.partition("|||")
+                status = int(status_text) if status_text.isdigit() else 0
+                if status in (301, 302, 303, 307, 308) and separator and redirect_url:
+                    current_url = urllib.parse.urljoin(current_url, redirect_url)
+                    continue
+                if response.returncode != 0 or status != 200 or not image_path.is_file():
+                    return None
+                data = image_path.read_bytes()
+                break
+    except Exception:
+        return None
+    if data is None:
+        return None
+    if len(data) != expected_size or hashlib.sha1(data).hexdigest().lower() != expected_sha1.lower():
+        return None
+    return data
+
+
+def _read_wallet_artwork(udid: str, pass_dir: str, output_path: str) -> tuple[str | None, str | None]:
+    remote_face = _download_wallet_asset(
+        udid, pass_dir, "cardBackgroundCombined.png.urls", "cardBackgroundCombined@2x.png"
+    )
+    if _save_wallet_image(remote_face, output_path):
+        return output_path, "walletRemoteFace"
+
+    for cache_suffix in (".cache", ".pkcache"):
+        front_face = read_file(udid, f"{pass_dir[:-7]}{cache_suffix}", "FrontFace", retries=1)
+        if _save_wallet_image(front_face, output_path):
+            return output_path, "walletFace"
+
+    manifest_bytes = read_file(udid, pass_dir, "manifest.json", retries=1)
+    artwork_name = _wallet_artwork_name(manifest_bytes)
+    if artwork_name:
+        artwork_dir, _, artwork_leaf = artwork_name.rpartition("/")
+        target_dir = f"{pass_dir}/{artwork_dir}" if artwork_dir else pass_dir
+        artwork = read_file(udid, target_dir, artwork_leaf, retries=1)
+        if _save_wallet_image(artwork, output_path):
+            return output_path, "passArtwork"
+
+    remote_icon = _download_wallet_asset(udid, pass_dir, "icon.png.urls", "icon@2x.png")
+    if _save_wallet_image(remote_icon, output_path):
+        return output_path, "walletRemoteArtwork"
+    return None, None
+
+
+def cmd_inspect_wallet_card(udid: str, card_hash: str, output_path: str):
+    if not re.fullmatch(r"[-A-Za-z0-9_+=]{20,44}", card_hash):
+        print(json.dumps({"ok": False, "error": "Invalid Wallet card identifier"}))
+        return
+
+    pass_dir = f"/var/mobile/Library/Passes/Cards/{card_hash}.pkpass"
+    pass_bytes = read_file(udid, pass_dir, "pass.json", retries=1)
+    if not pass_bytes:
+        print(json.dumps({
+            "ok": False,
+            "error": "Could not read the Wallet pass metadata. Check the log and device connection.",
+        }))
+        return
+
+    try:
+        pass_data = json.loads(pass_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        print(json.dumps({"ok": False, "error": "Wallet pass metadata is not valid JSON"}))
+        return
+    if not isinstance(pass_data, dict):
+        print(json.dumps({"ok": False, "error": "Wallet pass metadata has an unexpected format"}))
+        return
+
+    source = _pass_text(pass_data.get("organizationName")) or _pass_text(pass_data.get("logoText"))
+    name = _pass_text(pass_data.get("description")) or _pass_text(pass_data.get("logoText"))
+    number = _pass_card_suffix(pass_data)
+    artwork_path, artwork_kind = _read_wallet_artwork(udid, pass_dir, output_path)
+    print(json.dumps({
+        "ok": True,
+        "name": name,
+        "source": source,
+        "cardNumber": number,
+        "backgroundColor": _pass_text(pass_data.get("backgroundColor")),
+        "artworkPath": artwork_path,
+        "artworkKind": artwork_kind,
+    }, ensure_ascii=False))
 
 
 def cmd_save_cards(cards_json: str):
@@ -573,6 +807,8 @@ def main():
         cmd_get_saved_cards()
     elif norm_cmd == "save-cards" and len(sys.argv) > 2:
         cmd_save_cards(sys.argv[2])
+    elif norm_cmd == "inspect-card" and len(sys.argv) > 4:
+        cmd_inspect_wallet_card(sys.argv[2], sys.argv[3], sys.argv[4])
     elif norm_cmd == "prepare-image" and len(sys.argv) > 3:
         cmd_prepare_image(sys.argv[2], sys.argv[3])
     elif norm_cmd == "flash" and len(sys.argv) > 4:
